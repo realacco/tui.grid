@@ -25,7 +25,8 @@ const commonConfig = {
           },
         ],
         exclude: /node_modules/,
-      },
+      }
+      // CSS 로더는 mode에 따라 다르게 적용됩니다
     ],
   },
   resolve: {
@@ -63,8 +64,15 @@ module.exports = (env, { mode }) => {
         rules: [
           {
             test: /\.css$/,
-            exclude: /node_modules(?!\/@toast-ui\/select-box)/,
-            use: [MiniCssExtractPlugin.loader, 'css-loader'],
+            use: [
+              {
+                loader: MiniCssExtractPlugin.loader,
+                options: {
+                  publicPath: '../'
+                }
+              },
+              'css-loader'
+            ],
           },
         ],
       },
