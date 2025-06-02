@@ -8,7 +8,6 @@ import {
   OptAppendRow,
   OptAppendTreeRow,
   OptColumn,
-  OptFilter,
   OptGrid,
   OptHeader,
   OptI18nData,
@@ -19,6 +18,7 @@ import {
   OptRow,
   ResetOptions,
 } from '@t/options';
+import GridEvent from './event/gridEvent';
 import { Store } from '@t/store';
 import { CellValue, InvalidRow, Row, RowKey } from '@t/store/data';
 import { ColumnInfo } from '@t/store/column';
@@ -36,6 +36,10 @@ import {
 } from '@t/dataSource';
 import { ExportFormat, OptExport } from '@t/store/export';
 import { createStore } from './store/create';
+import {
+  refreshLayout as dimensionRefreshLayout,
+  setWidth as dimensionSetWidth,
+} from './dispatch/dimension';
 import { Root } from './view/root';
 import { createDispatcher, Dispatch } from './dispatch/create';
 import themeManager, { ThemeOptionPresetNames } from './theme/manager';
@@ -47,7 +51,6 @@ import {
   deepCopy,
   find,
   findPropIndex,
-  hasOwnProp,
   includes,
   isEmpty,
   isNil,
@@ -1561,12 +1564,21 @@ export default class Grid implements TuiGrid {
   }
 
   /**
-   * Expand tree row.
+   * Collapse tree row.
    * @param {number|string} rowKey - The unique key of the row
-   * @param {boolean} recursive - true for recursively expand all descendant
+   * @param {boolean} recursive - true for recursively collapse all descendant
    */
   public collapse(rowKey: RowKey, recursive?: boolean) {
     this.dispatch('collapseByRowKey', rowKey, recursive);
+  }
+
+  /**
+   * Set filter for specific column.
+   * @param {string} columnName - The name of the column to filter
+   * @param {FilterOptionType | FilterOptionType[]} filterOptionType - The filter option type
+   */
+  public setFilter(columnName: string, filterOptionType: FilterOptionType | FilterOptionType) {
+    this.dispatch('setFilter', columnName, filterOptionType);
   }
 
   /**
@@ -1665,36 +1677,152 @@ export default class Grid implements TuiGrid {
    */
   public refreshLayout() {
     const containerEl = this.el.querySelector(`.${cls('container')}`) as HTMLElement;
-    const { parentElement } = this.el;
+    if (containerEl) {
+      const { parentElement } = containerEl;
+      const { width: containerWidth, autoWidth } = this.store.dimension;
+      const rightSideWidth = autoWidth ? 'auto' : `${containerWidth}px`;
 
-    this.dispatch('refreshLayout', containerEl, parentElement!);
-  }
-
-  /**
-   * Destroy the instance.
-   */
-  public destroy() {
-    render('', this.el, this.gridEl);
-    clearTreeRowKeyMap(this.store.id);
-    for (const key in this) {
-      if (hasOwnProp(this, key)) {
-        delete this[key];
-      }
+      // dispatch는 명령어와 최대 2개의 인자만 받을 수 있음
+      // refreshLayout은 별도 함수를 직접 호출하는 방식으로 변경
+      dimensionRefreshLayout(this.store, containerEl, parentElement || document.body);
+      this.dispatch('setBodyHeight', this.store.dimension.bodyHeight);
+      // setWidth 함수는 3개의 인자(store, width, autoWidth)를 필요로 함
+      // rightSideWidth를 파싱하여 width 값 구함
+      // width 매개변수는 null을 허용하지 않으므로 0으로 기본값 설정
+      const width = !autoWidth ? parseInt(rightSideWidth, 10) || 0 : 0;
+      // 직접 dimensionSetWidth 함수 호출
+      dimensionSetWidth(this.store, width, autoWidth);
     }
   }
 
   /**
-   * Set the option of column filter.
-   * @param {string} columnName - columnName
-   * @param {string | FilterOpt} filterOpt - filter type
+   * Destroy the grid instance.
+   * @param {boolean} [onlyInstance=false] - Whether to destroy only the instance or the instance and the element.
    */
-  public setFilter(columnName: string, filterOpt: OptFilter | FilterOptionType) {
-    this.dispatch('setFilter', columnName, filterOpt);
+  public destroy(onlyInstance = false) {
+    // Fire 'beforeDestroy' event before destroying
+    try {
+      // Create proper event object
+      const gridEvent = new GridEvent();
+      // setInstance method is the correct way to set the instance
+      gridEvent.setInstance((this as unknown) as TuiGrid);
+      this.eventBus.trigger('onGridBeforeDestroy' as 'click', gridEvent);
+    } catch (e) {
+      // Ignore trigger errors
+    }
+
+    // Remove all event listeners
+    const eventBusEvents = [
+      'click',
+      'dblclick',
+      'mousedown',
+      'mouseover',
+      'mouseout',
+      'focusin',
+      'focusout',
+      'keydown',
+      'keypress',
+      'dragstart',
+      'dragover',
+      'drop',
+      'paste',
+      'copy',
+    ];
+    eventBusEvents.forEach((eventName) => {
+      try {
+        this.eventBus.off(eventName as 'click');
+      } catch (e) {
+        // Ignore off errors
+      }
+    });
+
+    // Clean up data provider functions
+    if (this.dataProvider) {
+      this.dataProvider.setRequestParams = () => {};
+      this.dataProvider.request = () => {};
+    }
+
+    // Clean up pagination manager if it exists
+    if (this.paginationManager) {
+      // Set to no-op functions instead of calling destroy
+      (this.paginationManager as any).moveToFirstPage = () => {};
+      (this.paginationManager as any).moveToLastPage = () => {};
+    }
+
+    // Clear any intervals or timeouts
+    Object.keys(this).forEach((key) => {
+      if (key.includes('interval') || key.includes('timeout')) {
+        const timerId = (this as any)[key];
+        if (typeof timerId === 'number') {
+          try {
+            window.clearTimeout(timerId);
+            window.clearInterval(timerId);
+          } catch (e) {
+            // Ignore clear errors
+          }
+        }
+      }
+    });
+
+    // Clear cached data and indexes from the store
+    if (this.store) {
+      // Clear tree row key maps
+      if (this.store.column.treeColumnName) {
+        try {
+          clearTreeRowKeyMap(this.store.id);
+        } catch (e) {
+          // Ignore clear errors
+        }
+      }
+
+      // Reset arrays or objects to prevent memory leaks
+      if (this.store.data) {
+        this.store.data.checkedAllRows = false;
+        if (Array.isArray(this.store.data.filteredRawData)) {
+          this.store.data.filteredRawData = [];
+        }
+        if (Array.isArray(this.store.data.filteredViewData)) {
+          this.store.data.filteredViewData = [];
+        }
+        if (this.store.data.sortState && Array.isArray(this.store.data.sortState.columns)) {
+          this.store.data.sortState.columns = [];
+        }
+      }
+    }
+
+    // Unmount React/Preact components
+    const rootEl = this.el.querySelector(`.${cls('container')}`);
+    if (rootEl && !onlyInstance) {
+      try {
+        // Use Preact render with null to unmount and clean up DOM
+        render(null, rootEl, rootEl.lastChild as Element);
+
+        // Clean up DOM element
+        while (this.el.firstChild) {
+          this.el.removeChild(this.el.firstChild);
+        }
+      } catch (e) {
+        // In case of render errors, try to clean up manually
+        try {
+          rootEl.innerHTML = '';
+        } catch (innerE) {
+          // Ignore cleanup errors
+        }
+      }
+    }
+
+    // Clean up instance references for garbage collection
+    this.dispatch = null as any;
+    this.store = null as any;
+    this.dataProvider = null as any;
+    this.dataManager = null as any;
+    this.eventBus = null as any;
+    this.paginationManager = null as any;
   }
 
   /**
    * Get filter state.
-   * @returns {Array.<FilterState>} - filter state
+   * @returns {Object} - filter state
    */
   public getFilterState() {
     // @TODO: unify the structure to ResetOptions.filterState type definition
